@@ -1,0 +1,11 @@
+signal.o: signal.c log.h maild.h
+local.o: local.c maild.h log.h privcmd.h
+log.o: log.c util.h log.h
+privcmd.o: privcmd.c
+nvdoor.o: nvdoor.c maild.h
+client.o: client.c maild.h
+aliases.o: aliases.c aliases.h log.h
+util.o: util.c util.h
+server.o: server.c maild.h msg.h local.h log.h util.h
+maild.o: maild.c maild.h local.h log.h
+msg.o: msg.c maild.h util.h log.h msg.h
