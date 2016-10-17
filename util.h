@@ -28,7 +28,7 @@ uint64_t random64(void);
 FILE *fopenat(int, const char *, const char *, ...);
 FILE *fmktempat(int, const char *, char **);
 ssize_t read_deadline(int, void *, size_t, time_t);
-boolean_t read_line_deadline(FILE *, char *, size_t, time_t);
+ssize_t read_line_deadline(FILE *, char *, size_t, time_t);
 const char *get_username(uid_t);
 const char *rfc822_date(void);
 boolean_t set_nonblock(FILE *, boolean_t);

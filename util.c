@@ -215,28 +215,35 @@ read_deadline(int fd, void *buf, size_t len, time_t deadline)
 }
 
 /* assumes fileno(f) has been set nonblocking */
-boolean_t
+ssize_t
 read_line_deadline(FILE *f, char *buf, size_t buflen, time_t deadline)
 {
-	char *p = buf;
+	ssize_t n = 0;
 	time_t now = time(NULL);
 
 	if (now > deadline)
 		goto toolate;
 
-	while ((size_t)(p - buf) < buflen) {
+	while (n + 1 < buflen) {
+		errno = 0;
 		int c = fgetc(f);
 
 		if (c != EOF) {
-			*p++ = c;
+			buf[n++] = c;
 			if (c == '\n')
 				break;
 
 			continue;
 		}
 
-		if (errno != EAGAIN)
-			return (B_FALSE);
+		switch (errno) {
+		case 0:
+			return (n);
+		case EAGAIN:
+			break;
+		default:
+			return (-1);
+		}
 
 		struct pollfd fds = {
 			.fd = fileno(f),
@@ -249,16 +256,16 @@ read_line_deadline(FILE *f, char *buf, size_t buflen, time_t deadline)
 		int nfd = poll(&fds, 1, deadline - now);
 
 		if (nfd == -1)
-			return (B_FALSE);
+			return (-1);
 		if (nfd == 0)
 			goto toolate;
 	}
-
-	return (B_TRUE);
+	buf[n] = '\0';
+	return (n);
 
 toolate:
 	errno = ETIMEDOUT;
-	return (B_FALSE);
+	return ((ssize_t)-1);
 }
 
 const char *
