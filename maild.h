@@ -35,6 +35,9 @@ extern "C" {
 #define	MAILD_NVDEFER	"defer"
 #define	MAILD_NVHEADER	"use-header"
 
+#define	MAILD_NVRESP	"response"
+#define	MAILD_NVID	"id"
+
 #define	MSG_TEMP	".msg-"
 
 typedef enum mailcmd {
@@ -46,9 +49,11 @@ typedef enum mailcmd {
 
 typedef enum mailresp {
 	MAILD_SUCCESS,
-	MAILD_FAILURE,
+	MAILD_FAILURE,	/* unspecified failure */
+	MAILD_INVAL,	/* invalid address */
 	MAILD_TIMEOUT,
-	MAILD_TOOBIG
+	MAILD_TOOBIG,	/* message size is too big */
+	MAILD_LINE	/* line too long */
 } mailresp_t;
 
 #define	EVENT_SIGNAL	(1)

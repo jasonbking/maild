@@ -42,11 +42,9 @@
 #include "util.h"
 
 /* config defaults */
-//char *maild_doorpath = "/var/run/maild";
-char *maild_doorpath = "/tmp/maild_door";
+char *maild_doorpath = "/var/run/maild";
 char *smarthost = NULL;
-//char *spooldir = "/var/spool/maild";
-char *spooldir = "/export/home/jking/maild/spool";
+char *spooldir = "/var/spool/maild";
 char *aliasfile = "/etc/mail/aliases";
 char *masquerade_host = NULL;
 char *masquerade_user = NULL;
@@ -54,7 +52,6 @@ char *hostname = NULL;
 boolean_t local_delivery = B_TRUE;
 
 int maild_door = -1;
-int evport = -1;
 int spoolfd = -1;
 
 /* how long we take to receive a message from a client */
@@ -82,28 +79,30 @@ static msg_t *msg_head;
 static msg_t *msg_tail;
 
 static timer_t queue_timer;
+static volatile boolean_t stop = B_FALSE;
 
+static void server_loop(void);
 static void server_signal(int);
 static void server_door_create(void);
 static void server_door_handler(void *, char *, size_t, door_desc_t *, uint_t);
-static boolean_t server_newmsg(nvlist_t *, const ucred_t *, int);
+static boolean_t server_newmsg(nvlist_t *, const ucred_t *, int, nvlist_t *);
 static boolean_t server_deliver_msg(msg_t *);
 static void server_defer_msg(msg_t *);
 static void server_load_queue(void);
+static void client_return_err(void);
+static void server_return_resp(nvlist_t *);
 static void init_hostname(void);
 static void init_timer(int);
 
 void
 server(void)
 {
-	port_event_t pe = { 0 };
-	timespec_t ts = { 0 };
-	int ret;
-	boolean_t done = B_FALSE;
-
 	(void) setlocale(LC_ALL, "");
 
 	printf("starting server...\n");
+
+	if (getenv("SPOOL") != NULL)
+		spooldir = getenv("SPOOL");
 
 	init_hostname();
 
@@ -143,9 +142,22 @@ server(void)
 
 	/* XXX: try to deliver if anything remaining */
 
+	server_loop();
+
+	(void) fdetach(maild_doorpath);
+	(void) door_revoke(maild_door);
+	(void) unlink(maild_doorpath);
+}
+
+static void
+server_loop(void)
+{
 	printf("Waiting for requests\n");
-	while (!done) {
+
+	while (!stop) {
+		port_event_t pe = { 0 };
 		msg_t *msg = NULL;
+		int ret = -1;
 
 		ret = port_get(evport, &pe, NULL);
 		if (ret != 0) {
@@ -227,46 +239,41 @@ server_door_create(void)
 	}
 }
 
-static void client_return_err(int);
-
 static void
 server_door_handler(void *cookie, char *argp, size_t arg_size, door_desc_t *dp,
     uint_t n_desc)
 {
+	nvlist_t *req = NULL;
+	nvlist_t *resp = NULL;
 	ucred_t *uc = NULL;
+	uint32_t val = 0;
 
-	if (atomic_inc_uint_nv(&client_count) > max_clients)
-		client_return_err(ECONNREFUSED);
+	if (atomic_inc_uint_nv(&client_count) > max_clients) {
+		logmsg(LOG_INFO, "too many connections");
+		goto fail;
+	}
 
 	if (door_ucred(&uc) != 0) {
 		logmsg(LOG_ERR, "door_ucred failed: %m");
-		client_return_err(errno);
+		goto fail;
 	}
 
-	nvlist_t *req = NULL;
+	resp = fnvlist_alloc();
+
 	nvlist_unpack(argp, arg_size, &req, NULL);
 
 	(void) printf("request from pid %d\n", ucred_getpid(uc));
 	nvlist_print(stdout, req);
 
-	uint32_t val;
 	if (nvlist_lookup_uint32(req, MAILD_NVCMD, &val) != 0) {
 		logmsg(LOG_INFO, "received nvlist with missing cmd from "
 		    "pid %d uid %d", ucred_getpid(uc), ucred_getruid(uc));
-		ucred_free(uc);
-		nvlist_free(req);
-		client_return_err(EINVAL);
+		goto fail;
 	}
 
 	switch (val) {
 	case MAILD_SUBMIT:
-		if (!server_newmsg(req, uc,
-		    dp[0].d_data.d_desc.d_descriptor)) {
-			int save = errno;
-			ucred_free(uc);
-			nvlist_free(req);
-			client_return_err(save);
-		}
+		server_newmsg(req, uc, dp[0].d_data.d_desc.d_descriptor, resp);
 		break;
 	case MAILD_LIST_QUEUE:
 		break;
@@ -277,7 +284,7 @@ server_door_handler(void *cookie, char *argp, size_t arg_size, door_desc_t *dp,
 			logmsg(LOG_WARNING, "received MAILD_INIT_LOCAL "
 			    "from non-child pid %d uid %d",
 			    ucred_getpid(uc), ucred_getruid(uc));
-			client_return_err(EACCES);
+			goto fail;
 		}
 
 		VERIFY3U(n_desc, ==, 1);
@@ -287,15 +294,19 @@ server_door_handler(void *cookie, char *argp, size_t arg_size, door_desc_t *dp,
 	default:
 		logmsg(LOG_INFO, "received invalid command number %u from "
 		    "pid %d uid %d", ucred_getpid(uc), ucred_getruid(uc));
-		ucred_free(uc);
-		nvlist_free(req);
-		client_return_err(EINVAL);
+		goto fail;
 	}
 
 done:
 	ucred_free(uc);
 	nvlist_free(req);
-	(void) nvdoor_return(NULL, NULL, 0, B_FALSE);
+	server_return_resp(resp);
+
+fail:
+	nvlist_free(req);
+	nvlist_free(resp);
+	ucred_free(uc);
+	client_return_err();
 }
 
 static void
@@ -308,12 +319,12 @@ server_signal(int sig)
 	case SIGINT:
 		(void) printf("Exiting on SIGINT\n");
 		local_stop();
-		exit(1);
+		stop = B_TRUE;
 	}
 }
 
 static boolean_t
-server_newmsg(nvlist_t *req, const ucred_t *uc, int fd)
+server_newmsg(nvlist_t *req, const ucred_t *uc, int fd, nvlist_t *resp)
 {
 	const char *username = NULL;
 	msg_t *msg = NULL;
@@ -325,38 +336,74 @@ server_newmsg(nvlist_t *req, const ucred_t *uc, int fd)
 	boolean_t defer;
 	boolean_t ignore_dot;
 
+	username = get_username(ucred_getruid(uc));
+
 	(void) nvlist_lookup_string(req, MAILD_NVSENDER, &from);
 	(void) nvlist_lookup_string_array(req, MAILD_NVTO, &to, &n_to);
 	ret |= nvlist_lookup_boolean_value(req, MAILD_NVHEADER, &use_header);
 	ret |= nvlist_lookup_boolean_value(req, MAILD_NVDEFER, &defer);
 	ret |= nvlist_lookup_boolean_value(req, MAILD_NVDOTS, &ignore_dot);
+	/*
+	 * the client code shouldn't trigger these, however since anyone
+	 * is free to invoke the door, still need verification
+	 */
 	if (ret != 0) {
-		/* XXX msg */
-		errno = EINVAL;
+		logmsg(LOG_ERR, "invalid request (missing data in nvlist) "
+		    "from %s pid %d", username, ucred_getpid(uc));
+
+		fnvlist_add_uint32(resp, MAILD_NVRESP, MAILD_INVAL);
 		return (B_FALSE);
 	}
 	if (!use_header && (from == NULL || n_to == 0)) {
-		/* XXX: msg */
-		errno = EINVAL;
+		logmsg(LOG_ERR, "invalid request (from or to address missing)"
+		    "from %s pid %d", username, ucred_getpid(uc));
+		fnvlist_add_uint32(resp, MAILD_NVRESP, MAILD_INVAL);
 		return (B_FALSE);
 	}
 
-	username = get_username(ucred_getruid(uc));
-
 	msg = msg_new(username, from, fd, client_timeout, use_header,
 	    ignore_dot);
-	if (msg == NULL)
+	if (msg == NULL) {
+		switch (errno) {
+		case EFBIG:
+			ret = MAILD_TOOBIG;
+			break;
+		case EOVERFLOW:
+			ret = MAILD_LINE;
+			break;
+		case ETIMEDOUT:
+			ret = MAILD_TIMEOUT;
+			break;
+		default:
+			ret = MAILD_FAILURE;
+		}
+
+		fnvlist_add_uint32(resp, MAILD_NVRESP, ret);
 		return (B_FALSE);
+	}
 
 	for (size_t i = 0; i < n_to; i++) {
 		if (!msg_add_recipient(msg, to[i])) {
 			msg_free(msg, B_TRUE);
+			fnvlist_add_uint32(resp, MAILD_NVRESP, MAILD_FAILURE);
 			return (B_FALSE);
 		}
 	}
 
+	char *id = xstrdup(msg->msg_id);
+
+	/*
+	 * while unlikely, using msg->msg_id after the port_send could
+	 * result in a use after free if for some reason the message
+	 * was able to be delivered before we add it to the response
+	 * nvlist, so a copy is used
+	 */
 	VERIFY0(port_send(evport, (defer) ? EVENT_DEFERMSG : EVENT_NEWMSG,
 	    msg));
+
+	fnvlist_add_uint32(resp, MAILD_NVRESP, MAILD_SUCCESS);
+	fnvlist_add_string(resp, MAILD_NVID, id);
+	free(id);
 
 	return (B_TRUE);
 }
@@ -364,6 +411,8 @@ server_newmsg(nvlist_t *req, const ucred_t *uc, int fd)
 static boolean_t
 server_deliver_msg(msg_t *msg)
 {
+	/* XXX temp */
+	msg_free(msg, B_FALSE);
 	return (B_FALSE);
 }
 
@@ -422,11 +471,18 @@ server_load_queue(void)
 }
 
 static void
-client_return_err(int errnum)
+client_return_err(void)
 {
 	nvlist_t *resp = fnvlist_alloc();
 
-	fnvlist_add_uint32(resp, "response", (uint32_t)errnum);
+	fnvlist_add_uint32(resp, MAILD_NVRESP, MAILD_FAILURE);
+	atomic_dec_uint(&client_count);
+	(void) nvdoor_return(resp, NULL, 0, B_TRUE);
+}
+
+static void
+server_return_resp(nvlist_t *resp)
+{
 	atomic_dec_uint(&client_count);
 	(void) nvdoor_return(resp, NULL, 0, B_TRUE);
 }

@@ -39,6 +39,8 @@
 extern void client(int, char **);
 extern void server(void);
 
+int evport = -1;
+
 int
 main(int argc, char **argv)
 {
@@ -47,6 +49,9 @@ main(int argc, char **argv)
 #define	TEXT_DOMAIN "SYS_TEST"
 #endif
 	(void) textdomain(TEXT_DOMAIN);
+
+	if (getenv("DOOR") != NULL)
+		maild_doorpath = getenv("DOOR");
 
 	if (getenv("SERVER") == NULL) {
 		client(argc, argv);

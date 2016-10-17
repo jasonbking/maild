@@ -142,7 +142,7 @@ msg_open(int dirfd, msg_t *msg)
 
 	if (msg->msg_attrdir <= 0) {
 		msg->msg_attrdir = openat(fileno(msg->msg_f), ".",
-		    O_RDWR|O_XATTR);
+		    O_RDONLY|O_XATTR);
 		if (msg->msg_attrdir == -1) {
 			logmsg(LOG_ERR, "unable to open extended attribute "
 			    "dir of %s: %m", msg->msg_filename);
@@ -344,7 +344,8 @@ save_val(msg_t *msg, const char *name, const char *val)
 		logmsg(LOG_ERR, "unable to create the %s attribute: %m", name);
 		return (B_FALSE);
 	}
-	if (fwrite(val, len, 1, f) != len)
+
+	if (fwrite(val, len, 1, f) != 1)
 		goto error;
 	if (fputc('\n', f) != '\n')
 		goto error;
@@ -374,8 +375,6 @@ typedef struct line_state {
 	char *addr_buf;
 	size_t addr_len;
 	size_t addr_alloc;
-	boolean_t ignore_dot;
-	boolean_t use_header;
 	boolean_t is_addr;
 	boolean_t body;
 	boolean_t has_date;
@@ -384,8 +383,10 @@ typedef struct line_state {
 	boolean_t skip;
 } state_t;
 
-static char *process_lines(msg_t *restrict, char *restrict, size_t,
-    boolean_t *restrict, state_t *restrict);
+static boolean_t save_line(msg_t *restrict, char * restrict, size_t,
+    state_t *restrict);
+static boolean_t check_addrs(msg_t * restrict, char * restrict, size_t,
+    state_t *restrict);
 
 /*
  * Save the incoming message from fd to the new spool file.  Transfer must
@@ -397,16 +398,13 @@ msg_recv(msg_t *msg, int fd, int timeout, boolean_t use_header,
     boolean_t ignore_dot)
 {
 	char buf[LINE_SZ] = { 0 };
-	char *end = buf;
+	FILE *in = NULL;
 	size_t total = 0;
 	ssize_t n = 0;
 	time_t deadline;
-	boolean_t ret = B_TRUE;
-	boolean_t done = B_FALSE;
 	state_t state = { 0 };
-
-	state.ignore_dot = ignore_dot;
-	state.use_header = use_header;
+	boolean_t ret = B_TRUE;
+	boolean_t has_nl = B_TRUE;
 
 	if (fseeko(msg->msg_f, 0, SEEK_END) == -1) {
 		logmsg(LOG_ERR, "unable to seek to end of message file: %m");
@@ -419,137 +417,81 @@ msg_recv(msg_t *msg, int fd, int timeout, boolean_t use_header,
 
 	deadline = time(NULL) + timeout;
 
-	/*CONSTCOND*/
-	while (!done) {
-		size_t len = sizeof (buf) - 1 - (size_t)(end - buf);
+	if ((in = fdopen(fd, "r")) == NULL) {
+		logmsg(LOG_ERR, "fdopen failed on input descriptor: %m");
+		return (B_FALSE);
+	}
+	if (!set_nonblock(in, B_TRUE)) {
+		logmsg(LOG_ERR, "unable to set input descriptor to "
+		    "non-blocking: %m");
+		(void) fclose(in);
+		return (B_FALSE);
+	}
 
+	/*CONSTCOND*/
+	while (1) {
 		errno = 0;
-		n = read_deadline(fd, end, len, deadline);
-		if (n <= 0)
+
+		if (!has_nl) {
+			errno = EOVERFLOW;
+			ret = B_FALSE;
 			break;
+		}
+
+		n = read_line_deadline(in, buf, sizeof (buf) - 1, deadline);
+
+		if (n < 0) {
+			if (errno != ETIMEDOUT)
+				logmsg(LOG_ERR, "failure reading message: %m");
+			(void) fclose(in);
+			ret = B_FALSE;
+			goto done;
+		}
 
 		if (total + n > max_msgsize) {
 			errno = EFBIG;
 			ret = B_FALSE;
-			break;
+			goto done;
 		}
-		total += n;
 
-		/* buf should always be NULL terminated */
-		ASSERT3S(buf[sizeof (buf) - 1], ==, '\0');
+		if (n > 0 && buf[n - 1] != '\n')
+			has_nl = B_FALSE;
 
-		end = process_lines(msg, buf, sizeof (buf), &done, &state);
-		if (end == NULL) {
-			ret = B_FALSE;
+		if (n == 0)
 			break;
+
+		if (!ignore_dot && n == 2 && buf[0] == '.')
+			break;
+
+		/*
+		 * XXX: should we consider a non-continuation line
+		 * without a colon to trigger the start of the message body?
+		 */
+		if (!state.body && n == 1 && buf[0] == '\n')
+			state.body = B_TRUE;
+
+		VERIFY(save_line(msg, buf, n, &state));
+		if (use_header && !check_addrs(msg, buf, n, &state)) {
+			errno = EINVAL;
+			ret = B_FALSE;
+			goto done;
 		}
 	}
 
-	if (n < 0 || process_lines(msg, buf, sizeof (buf), NULL,
-	    &state) == NULL)
+	if (!has_nl)
+		buf[n++] = '\n';
+
+	if (!save_line(msg, NULL, 0, &state)) {
 		ret = B_FALSE;
+		goto done;
+	}
+	if (use_header && !check_addrs(msg, NULL, 0, &state)) {
+		ret = B_FALSE;
+	}
 
 done:
 	free(state.addr_buf);
 	return (ret);
-}
-
-static boolean_t save_line(msg_t *restrict, char * restrict, size_t,
-    state_t *restrict);
-static boolean_t check_addrs(msg_t * restrict, char * restrict, size_t,
-    state_t *restrict);
-
-static char * 
-process_lines(msg_t * restrict msg, char * restrict buf, size_t bufalloc,
-    boolean_t * restrict donep, state_t *restrict statep)
-{
-	char *start, *end;
-	size_t buflen = strlen(buf);
-	size_t len;
-
-	ASSERT3U(n, <, bufalloc);
-
-	start = end = buf;
-
-	if (donep == NULL) {
-		if (buflen > 0) {
-			if (buflen + 1 >= bufalloc) {
-				errno = EOVERFLOW;
-				return (NULL);
-			}
-
-			buf[buflen++] = '\n';
-			if (!save_line(msg, buf, buflen, statep))
-				return (NULL);
-		}
-
-		if (!save_line(msg, NULL, 0, statep))
-			return (NULL);
-	}
-
-	while (1) {
-		end = strchr(start, '\n');
-		if (end == NULL)
-			break;
-
-		end++;
-		len = (size_t)(end - start);
-
-		if (!statep->ignore_dot && len == 2 && *start == '.') {
-			if (donep != NULL)
-				*donep = B_TRUE;
-			*start = '\0';
-			break;
-		}
-
-		if (!statep->body && len == 1 && *start == '\n') {
-			statep->body = B_TRUE;
-			start = end;
-
-			if (statep->use_header
-			    && !check_addrs(msg, NULL, 0, statep)) {
-				return (NULL);
-			}
-
-			continue;
-		}
-
-		if (!save_line(msg, start, len, statep))
-			return (NULL);
-
-		if (statep->use_header && !statep->body
-		    && !check_addrs(msg, start, len, statep))
-			return (NULL);
-
-		start = end;
-	}
-
-	if (*start == '\0') {
-		/* no partial line, clear everything and reset */
-		(void) memset(buf, 0, bufalloc);
-		return (buf);
-	}
-
-	/* partial line at the start of the buffer */
-	if (start == buf) {
-		/* line too long */
-		if (buflen + 1 == bufalloc) {
-			errno = EOVERFLOW;
-			return (NULL);
-		}
-
-		/* return end of current data */
-		return (buf + buflen);
-	}
-
-	/* partial line, shift over */
-	end = buf + buflen;
-	len = (size_t)(end - start);
-
-	/* I can actually read man pages */
-	(void) memmove(buf, start, len);
-	(void) memset(buf + len, 0, bufalloc - len);
-	return (buf + len);
 }
 
 static boolean_t

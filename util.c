@@ -159,11 +159,11 @@ fmktempat(int fd, const char *prefix, char **filenamep)
 	char *filename = NULL;
 	size_t len = 0;
 
-	len = strlen(prefix);
-	filename = zalloc(len + 8 + 1);	/* 8 hex digits + NULL */
+	len = strlen(prefix) + 8 + 1; /* 32-bit hex value + NULL */
+	filename = zalloc(len);
 
 	while (1) {
-		(void) snprintf(filename, len, "%s%0" PRIx32, prefix,
+		(void) snprintf(filename, len, "%s%08" PRIx32, prefix,
 		    random32());
 
 		if ((f = fopenat(fd, filename, "w+x", 0600)) != NULL)
@@ -181,45 +181,14 @@ fmktempat(int fd, const char *prefix, char **filenamep)
 	return (f);
 }
 
-/*
- * Read from a file descriptor, waiting upto deadline time as passed.
- * Return the number of bytes read, or -1 on error.
- * If deadline has passed, return -1 and set errno to ETIMEDOUT
- */
-ssize_t
-read_deadline(int fd, void *buf, size_t len, time_t deadline)
-{
-        struct pollfd fds = {
-                .fd = fd,
-                .events = POLLIN
-        };
-        time_t now = time(NULL);
-        int nfd = -1;
-
-        if (now >= deadline) {
-                errno = ETIMEDOUT;
-                return (-1);
-        }
-
-        nfd = poll(&fds, 1, deadline - now);
-        if (nfd == -1) {
-                return (-1);
-        } else if (nfd == 0) {
-                errno = ETIMEDOUT;
-                return (-1);
-        }
-
-        VERIFY3S(nfd, ==, 1);
-
-        return (read(fd, buf, len));
-}
-
 /* assumes fileno(f) has been set nonblocking */
 ssize_t
 read_line_deadline(FILE *f, char *buf, size_t buflen, time_t deadline)
 {
 	ssize_t n = 0;
 	time_t now = time(NULL);
+
+	ASSERT3S(fcntl(fileno(f), F_GETFL, 0) & O_NONBLOCK, ==, O_NONBLOCK);
 
 	if (now > deadline)
 		goto toolate;
@@ -247,13 +216,13 @@ read_line_deadline(FILE *f, char *buf, size_t buflen, time_t deadline)
 
 		struct pollfd fds = {
 			.fd = fileno(f),
-			.events = POLLIN
+			.events = POLLIN,
 		};
 
 		if (time(&now) > deadline)
 			goto toolate;
 
-		int nfd = poll(&fds, 1, deadline - now);
+		int nfd = poll(&fds, 1, (deadline - now) * 1000);
 
 		if (nfd == -1)
 			return (-1);
@@ -320,7 +289,7 @@ set_nonblock(FILE *f, boolean_t set)
 	int fd = fileno(f);
 	int flags = 0;
 
-	if ((flags = fcntl(fd, F_GETFD, 0)) < 0)
+	if ((flags = fcntl(fd, F_GETFL, 0)) < 0)
 		return (B_FALSE);
 
 	if (set)
@@ -328,7 +297,7 @@ set_nonblock(FILE *f, boolean_t set)
 	else 
 		flags &= ~(O_NONBLOCK);
 
-	if (fcntl(fd, F_SETFD, flags) < 0)
+	if (fcntl(fd, F_SETFL, flags) < 0)
 		return (B_FALSE);
 
 	return (B_TRUE);
