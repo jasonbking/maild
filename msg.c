@@ -71,6 +71,9 @@ msg_new(const char *username, const char *sender, int in_fd, int timeout,
 	msg_t *msg = NULL;
 
 	msg = zalloc(sizeof (*msg));
+	if (sender == NULL)
+		sender = username;
+
 	msg->msg_sender = xstrdup(sender);
 
 	if (!msg_create_file(msg, username))
@@ -312,6 +315,9 @@ load_val(msg_t *msg, const char *name, char **valp)
 	char buf[LINE_SZ] = { 0 };
 	boolean_t ret = B_TRUE;
 
+	if (f == NULL)
+		return (B_FALSE);
+
 	if (fgets(buf, sizeof (buf), f) == NULL) {
 		logmsg(LOG_ERR, "unable to read %s attribute: %m", name);
 		ret = B_FALSE;
@@ -325,7 +331,15 @@ load_val(msg_t *msg, const char *name, char **valp)
 static boolean_t
 load_sender(msg_t *msg)
 {
-	return (load_val(msg, SENDER, &msg->msg_from));
+	if (load_val(msg, SENDER, &msg->msg_from))
+		return (B_TRUE);
+
+	/* bounce notifications have an empty sender */
+	if (errno == ENOENT) {
+		msg->msg_from = xstrdup("");
+		return (B_TRUE);
+	}
+	return (B_FALSE);
 }
 
 static boolean_t
@@ -362,6 +376,10 @@ error:
 static boolean_t
 save_sender(msg_t *msg)
 {
+	/* bounce messages havean empty sender */
+	if (msg->msg_sender[0] == '\0')
+		return (B_TRUE);
+
 	return (save_val(msg, SENDER, msg->msg_sender));
 }
 

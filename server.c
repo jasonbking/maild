@@ -70,11 +70,9 @@ static int read_timeout = 30;
 /* maximum message size */
 size_t max_msgsize = 10 * 1024 * 1024;
 
-/*
- * Currently only the main thread listening on the event port manipulates
- * these.  If multiple threads are added for the event port loop, a mutex
- * will need to be added.
- */
+static int queue_scan_interval = 5; /* minutes */
+
+static pthread_rwlock_t msg_lock = PTHREAD_RWLOCK_INITIALIZER;
 static msg_t *msg_head;
 static msg_t *msg_tail;
 
@@ -89,10 +87,11 @@ static boolean_t server_newmsg(nvlist_t *, const ucred_t *, int, nvlist_t *);
 static boolean_t server_deliver_msg(msg_t *);
 static void server_defer_msg(msg_t *);
 static void server_load_queue(void);
+static void process_queue(void);
 static void client_return_err(void);
 static void server_return_resp(nvlist_t *);
 static void init_hostname(void);
-static void init_timer(int);
+static void init_timer(int, int);
 
 void
 server(void)
@@ -117,7 +116,7 @@ server(void)
 	if (evport == -1)
 		err(EXIT_FAILURE, "port_create() failed");
 
-	init_timer(evport);
+	init_timer(evport, queue_scan_interval);
 	init_log("maild", B_TRUE);
 	signal_init(evport);
 	server_door_create();
@@ -173,7 +172,7 @@ server_loop(void)
 		case PORT_SOURCE_USER:
 			break;
 		case PORT_SOURCE_TIMER:
-			/* XXX */
+			process_queue();
 			break;
 		case PORT_SOURCE_FILE:
 			/* XXX */
@@ -424,12 +423,45 @@ server_defer_msg(msg_t *msg)
 	msg->msg_f = NULL;
 	msg->msg_headerf = NULL;
 
+	VERIFY0(pthread_rwlock_wrlock(&msg_lock));
+
 	if (msg_tail == NULL) {
 		msg_head = msg_tail = msg;
 		return;
 	}
 	msg_tail->msg_next = msg;
 	msg_tail = msg;
+
+	VERIFY0(pthread_rwlock_unlock(&msg_lock));
+}
+
+static void
+process_queue(void)
+{
+	msg_t *msg = NULL;
+	msg_t *prev = NULL;
+	size_t n = 0;
+
+	VERIFY0(pthread_rwlock_wrlock(&msg_lock));
+
+	logmsg(LOG_DEBUG, "processing queue");
+
+	if (msg_head == NULL) {
+		logmsg(LOG_DEBUG, "queue is empty");
+		VERIFY0(pthread_rwlock_unlock(&msg_lock));
+		return;
+	}
+
+	msg = msg_head;
+	while (msg != NULL) {
+		/* XXX */
+		prev = msg;
+		msg = msg->msg_next;
+	}
+
+	logmsg(LOG_DEBUG, "processed %zu messages", n);
+
+	VERIFY0(pthread_rwlock_unlock(&msg_lock));
 }
 
 static void
@@ -500,10 +532,11 @@ init_hostname(void)
 }
 
 static void
-init_timer(int port)
+init_timer(int port, int interval)
 {
 	struct sigevent sigev = { 0 };
 	port_notify_t pn = { 0 };
+	struct itimerspec it = { 0 };
 
 	pn.portnfy_port = port;
 	pn.portnfy_user = NULL;
@@ -512,4 +545,7 @@ init_timer(int port)
 
 	if (timer_create(CLOCK_REALTIME, &sigev, &queue_timer) < 0)
 		err(EXIT_FAILURE, "timer_create() failed");
+
+	it.it_value.tv_sec = it.it_interval.tv_sec = interval * 60;
+	VERIFY0(timer_settime(queue_timer, 0, &it, NULL));
 }
